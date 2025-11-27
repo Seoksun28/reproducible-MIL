@@ -6,44 +6,60 @@ from scipy.stats import rankdata
 
 # --- 설정 구간 (여기만 수정하면 됨) ---
 SLIDE_PATH = 'path/to/slide.svs'      # WSI 파일 경로
-COORDS_PATH = 'path/to/patches.h5'    # Patch 좌표 h5 파일 (npz에서 쓰던 coords랑 같은 레벨이어야 함)
+COORDS_PATH = 'path/to/patches.h5'    # Trident coords h5 (coords: Level 0 기준)
 SCORES_PATH = 'path/to/scores.npy'    # Attention score npy 파일
 OUTPUT_PATH = 'clam_style_heatmap.jpg'
 
-PATCH_SIZE = 256        # "학습에 쓰인 patch 이미지 크기" (예: 256x256)
-VIS_LEVEL = 2           # 시각화할 배율 (1~2 추천, -1이면 자동 계산)
-ALPHA = 0.4             # 투명도 (0.0 ~ 1.0, 0.4가 CLAM 기본값)
-BLUR = True             # True면 부드럽게 블러 처리 (CLAM 스타일), False면 격자무늬
-USE_PERCENTILES = True  # True면 점수를 등수로 변환 (CLAM 기본값 - 색대비가 뚜렷해짐)
+PATCH_SIZE = 256        # "모델 학습에 쓴 patch 크기" (예: 256x256 at target_mag)
+VIS_LEVEL = 2           # 시각화할 level (0 = 원본, 1/2 추천, -1이면 자동 선택)
+ALPHA = 0.4             # 히트맵 투명도 (0.0 ~ 1.0, CLAM은 0.4 근처)
+BLUR = True             # True면 부드럽게 Gaussian blur (CLAM 스타일)
+USE_PERCENTILES = True  # True면 rank -> 0~1 percentile로 변환 (CLAM 스타일)
 # ------------------------------------
 
 
-def infer_coord_scale(slide, coords, patch_size):
+def infer_patch_size_from_coords(coords_l0: np.ndarray,
+                                 default_patch_size_l0: float) -> float:
     """
-    coords가 level-0 기준인지, 이미 downsample된 좌표인지 대략 추정.
-    - 반환값: coord_to_level0_scale (coords * scale -> level0 좌표)
+    coords_l0: level-0 기준 좌표 (N, 2)
+    default_patch_size_l0: PATCH_SIZE * coord_to_level0 로 계산한 대략 값
+
+    → coords 간 최소 간격(dx, dy)을 이용해 실제 patch 한 변 길이를 추정.
+      (Trident 20x / patch_size 256 @40x 원본이면 보통 512로 나옴)
     """
-    w0, h0 = slide.level_dimensions[0]  # level 0 크기
-    max_x = coords[:, 0].max() + patch_size
-    max_y = coords[:, 1].max() + patch_size
+    xs = np.sort(np.unique(coords_l0[:, 0]))
+    ys = np.sort(np.unique(coords_l0[:, 1]))
 
-    # 좌표가 level0에 거의 꽉 차 있으면 scale ~ 1
-    sx = w0 / max_x
-    sy = h0 / max_y
-    est = (sx + sy) / 2.0
+    if len(xs) > 1:
+        dx = np.min(np.diff(xs))
+    else:
+        dx = default_patch_size_l0
 
-    # 보통 WSI는 40x/20x/10x 관계 → 0.5, 1, 2, 4 정도에서 골라주면 됨
-    candidates = np.array([0.5, 1.0, 2.0, 4.0])
-    best = candidates[np.argmin(np.abs(candidates - est))]
-    print(f"[DEBUG] inferred coord_to_level0_scale ≈ {best:.2f} (raw est={est:.2f})")
-    return best
+    if len(ys) > 1:
+        dy = np.min(np.diff(ys))
+    else:
+        dy = default_patch_size_l0
+
+    inferred = float(max(dx, dy))  # x, y 중 큰 쪽을 patch 크기로 간주
+
+    # 너무 말이 안 되면 기본값으로 롤백
+    if inferred < default_patch_size_l0 * 0.5 or inferred > default_patch_size_l0 * 2.0:
+        print(
+            f"[WARN] inferred patch_size_l0={inferred}이(default={default_patch_size_l0})와 너무 달라 "
+            f"기본값({default_patch_size_l0}) 사용"
+        )
+        return default_patch_size_l0
+
+    print(f"[DEBUG] inferred patch_size_l0 from coords = {inferred}")
+    return inferred
 
 
 def get_clam_style_heatmap():
-    print(f"Loading data...")
+    print("Loading slide and coordinates...")
     slide = openslide.OpenSlide(SLIDE_PATH)
 
     with h5py.File(COORDS_PATH, 'r') as f:
+        # Trident coords: 보통 h5 안에 'coords' (N, 2) 저장돼 있음
         coords = f['coords'][:]   # (N, 2)
 
     scores = np.load(SCORES_PATH)
@@ -55,12 +71,13 @@ def get_clam_style_heatmap():
     # 1) 점수 정규화 (CLAM 스타일)
     if USE_PERCENTILES:
         print("Converting scores to percentiles (CLAM Style)...")
-        scores = rankdata(scores) / len(scores)  # 0~1
+        scores = rankdata(scores) / len(scores)  # 0~1로 스케일
     else:
         scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
 
     # 2) 시각화 level 결정
     if VIS_LEVEL < 0:
+        # 자동 선택: 가로 길이가 5000 이하가 되는 가장 높은 해상도 level
         best_level = slide.level_count - 1
         for i in range(slide.level_count):
             if slide.level_dimensions[i][0] < 5000:
@@ -74,17 +91,22 @@ def get_clam_style_heatmap():
     ds_vis = float(slide.level_downsamples[vis_level])
     print(f"Visualization Level: {vis_level} (Size: {w_vis}x{h_vis}, DS: {ds_vis})")
 
-    # 3) coords가 어떤 스케일인지 추정해서 level-0 좌표로 보정
-    ### >>> 여기 추가: coords 기준 스케일 추정
-    coord_to_level0 = infer_coord_scale(slide, coords, PATCH_SIZE)
+    # 3) Trident coords는 이미 Level 0 기준 → scale = 1.0
+    coord_to_level0 = 1.0
     coords_l0 = coords.astype(np.float32) * coord_to_level0
 
-    # 4) level-0 패치 크기 계산 후 vis_level 기준으로 스케일
+    # 4) Level 0에서 patch 크기 추정
+    # 1차 기본값: PATCH_SIZE (target_mag에서의 patch 크기) * scale
     patch_size_l0 = PATCH_SIZE * coord_to_level0
+
+    # 2차 보정: coords 간 간격으로 실제 patch footprint 추론 (Trident 20x@40x면 512일 것)
+    patch_size_l0 = infer_patch_size_from_coords(coords_l0, patch_size_l0)
+
+    # vis_level 기준으로 스케일링
     scaled_patch_size = max(1, int(round(patch_size_l0 / ds_vis)))
     print(f"[DEBUG] patch_size_l0={patch_size_l0}, scaled_patch_size={scaled_patch_size}")
 
-    # 5) 히트맵 캔버스
+    # 5) 히트맵 캔버스 준비
     print("Drawing heatmap mask...")
     heatmap_mask = np.zeros((h_vis, w_vis), dtype=np.float32)
     count_mask = np.zeros((h_vis, w_vis), dtype=np.float32)
@@ -103,30 +125,30 @@ def get_clam_style_heatmap():
         heatmap_mask[y:y_end, x:x_end] += float(score)
         count_mask[y:y_end, x:x_end] += 1.0
 
-    # 7) overlap 있으면 평균
+    # 7) overlap 있으면 평균 내기
     nonzero = count_mask > 0
     heatmap_mask[nonzero] /= count_mask[nonzero]
     heatmap_mask[~nonzero] = 0.0
 
-    # 8) 0~255로 변환
+    # 8) 0~255로 정규화
     if heatmap_mask.max() > 0:
         heatmap_norm = (heatmap_mask / heatmap_mask.max()) * 255.0
     else:
         heatmap_norm = heatmap_mask * 0
     heatmap_uint8 = heatmap_norm.astype(np.uint8)
 
-    # 9) 블러 (CLAM 스타일)
+    # 9) 블러 처리 (CLAM 스타일)
     if BLUR:
-        k_size = max(3, (scaled_patch_size * 2) | 1)  # 홀수
+        # patch 두 칸 정도 커버하는 커널, 홀수로 맞추기
+        k_size = max(3, (scaled_patch_size * 2) | 1)
         print(f"[DEBUG] GaussianBlur ksize={k_size}")
         heatmap_uint8 = cv2.GaussianBlur(heatmap_uint8, (k_size, k_size), 0)
 
-    # 10) 컬러맵
+    # 10) 컬러맵 입히기
     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 11) 조직이 있는 위치만 남기기
+    # 11) 조직이 있는 위치만 마스킹 (coords 있었던 곳)
     tissue_mask = (count_mask > 0).astype(np.uint8)
-    # 필요하면 erode/dilate 해도 됨
 
     # 12) 원본 이미지 읽기
     print("Overlaying on WSI...")
@@ -136,7 +158,7 @@ def get_clam_style_heatmap():
 
     overlay = cv2.addWeighted(original_img, 1 - ALPHA, heatmap_color, ALPHA, 0)
 
-    # 조직 없는 부분은 원본 유지
+    # 조직 없는 부분은 원본만 남기기
     idx_bg = np.where(tissue_mask == 0)
     overlay[idx_bg] = original_img[idx_bg]
 
