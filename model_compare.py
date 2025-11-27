@@ -161,7 +161,7 @@ def train_one_epoch(model, loader, optimizer, device):
             feats,
             loss_fn=nn.CrossEntropyLoss(),
             label=labels,
-            return_attention=False,
+            return_attention=False, # CLAM에선 True
             return_slide_feats=False,
         )
         loss = results_dict["loss"]
@@ -178,12 +178,12 @@ def evaluate(model, loader, device):
     all_probs, all_preds, all_labels = [], [], []
 
     for feats, labels, _ in loader:
-        feats = feats.to(device)
+        feats = feats.to(device) # CLAM에선 labels = labels.to(device) 추가하기
         results_dict, _ = model(
             feats,
             loss_fn=None,
-            label=None,
-            return_attention=False,
+            label=None, # CLAM에선 여기서 labels를 넣어줘야됨
+            return_attention=False, # CLAM에선 True
             return_slide_feats=False,
         )
 
