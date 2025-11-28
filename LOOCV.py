@@ -52,7 +52,8 @@ def load_items_from_dirs(case_dir: str, control_dir: str):
             return
         if not os.path.isdir(dir_path):
             raise ValueError(f"Not a directory: {dir_path}")
-        for fname in os.listdir(dir_path):
+        # 정렬해서 순서 고정 (재현성)
+        for fname in sorted(os.listdir(dir_path)):
             if not fname.endswith(".npz"):
                 continue
             path = os.path.join(dir_path, fname)
@@ -81,7 +82,11 @@ class NPZSlideDataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.items[idx]
         npz = np.load(path)
-        feats = torch.from_numpy(npz[self.feature_key]).float()  # [M, D]
+        feats = npz[self.feature_key]
+        # sanity check
+        if feats.ndim != 2:
+            raise ValueError(f"features must be 2D [N, D], got {feats.shape} in {path}")
+        feats = torch.from_numpy(feats).float()  # [M, D]
         label = torch.tensor(label).long()
         return feats, label, path
 
@@ -110,6 +115,9 @@ class TransLayer(nn.Module):
         self.norm = nn.LayerNorm(dim)
         if num_landmarks is None:
             num_landmarks = dim // 2
+
+        if dim % heads != 0:
+            raise ValueError(f"embed_dim ({dim}) must be divisible by heads ({heads}).")
 
         self.attn = NystromAttention(
             dim=dim,
@@ -152,7 +160,7 @@ class TransMIL(nn.Module):
     def __init__(
         self,
         n_classes=2,
-        input_dim=1536,   # 패치 feature dim (여기서 1536으로 설정)
+        input_dim=1536,   # 패치 feature dim
         embed_dim=512,
         heads=8,
         num_landmarks=None,
@@ -160,6 +168,9 @@ class TransMIL(nn.Module):
         pinv_iterations=6,
     ):
         super().__init__()
+        if embed_dim % heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by heads ({heads}).")
+
         self.n_classes = n_classes
         self.input_dim = input_dim
         self.embed_dim = embed_dim
@@ -265,8 +276,23 @@ def train_one_epoch(model, loader, optimizer, device):
 # LOOCV
 # ===============================
 def run_loocv(args):
-    # device / seed
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    # ===== device 선택 (GPU 인덱스 반영) =====
+    if args.device == "cuda":
+        if torch.cuda.is_available():
+            n_gpu = torch.cuda.device_count()
+            if args.gpu < 0 or args.gpu >= n_gpu:
+                print(f"[WARN] GPU index {args.gpu} is out of range (0~{n_gpu-1}). CPU로 fallback 합니다.")
+                device_str = "cpu"
+            else:
+                device_str = f"cuda:{args.gpu}"
+        else:
+            print("[WARN] CUDA not available. CPU로 fallback 합니다.")
+            device_str = "cpu"
+    else:
+        device_str = "cpu"
+
+    device = torch.device(device_str)
+    print(f"[INFO] Using device: {device}")
     set_seed(args.seed)
 
     # 데이터 로드 (case, control 디렉토리)
@@ -293,105 +319,103 @@ def run_loocv(args):
     # result.csv
     import csv
     csv_path = os.path.join(args.result_dir, "result.csv")
-    csv_f = open(csv_path, "w", newline="")
-    writer = csv.writer(csv_f)
-    writer.writerow(["slide", "label", "pred", "prob_pos"])
+    with open(csv_path, "w", newline="") as csv_f:
+        writer = csv.writer(csv_f)
+        writer.writerow(["slide", "label", "pred", "prob_pos"])
 
-    all_labels = []
-    all_probs = []
-    all_preds = []
+        all_labels = []
+        all_probs = []
+        all_preds = []
 
-    # ================== patient-wise LOOCV ==================
-    for fold_idx, test_pid in enumerate(patients):
-        print(f"\n========== Fold {fold_idx+1}/{len(patients)} | Test PID = {test_pid} ==========")
+        # ================== patient-wise LOOCV ==================
+        for fold_idx, test_pid in enumerate(patients):
+            print(f"\n========== Fold {fold_idx+1}/{len(patients)} | Test PID = {test_pid} ==========")
 
-        test_indices = pid_to_indices[test_pid]
-        train_indices = [
-            i for pid, idxs in pid_to_indices.items() if pid != test_pid for i in idxs
-        ]
+            test_indices = pid_to_indices[test_pid]
+            train_indices = [
+                i for pid, idxs in pid_to_indices.items() if pid != test_pid for i in idxs
+            ]
 
-        train_items = [items[i] for i in train_indices]
-        test_items = [items[i] for i in test_indices]
+            train_items = [items[i] for i in train_indices]
+            test_items = [items[i] for i in test_indices]
 
-        print(f"Train slides: {len(train_items)}, Test slides: {len(test_items)}")
+            print(f"Train slides: {len(train_items)}, Test slides: {len(test_items)}")
 
-        train_loader = DataLoader(
-            NPZSlideDataset(train_items, feature_key=args.feature_key),
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            collate_fn=mil_collate,
-            pin_memory=True,
-        )
+            train_loader = DataLoader(
+                NPZSlideDataset(train_items, feature_key=args.feature_key),
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
+                collate_fn=mil_collate,
+                pin_memory=True,
+            )
 
-        test_loader = DataLoader(
-            NPZSlideDataset(test_items, feature_key=args.feature_key),
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=mil_collate,
-            pin_memory=True,
-        )
+            test_loader = DataLoader(
+                NPZSlideDataset(test_items, feature_key=args.feature_key),
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=mil_collate,
+                pin_memory=True,
+            )
 
-        # ----- 모델 생성 -----
-        model = TransMIL(
-            n_classes=args.n_classes,
-            input_dim=args.input_dim,
-            embed_dim=args.embed_dim,
-            heads=args.heads,
-            num_landmarks=args.num_landmarks,
-            attn_dropout=args.attn_dropout,
-            pinv_iterations=args.pinv_iterations,
-        ).to(device)
+            # ----- 모델 생성 -----
+            model = TransMIL(
+                n_classes=args.n_classes,
+                input_dim=args.input_dim,
+                embed_dim=args.embed_dim,
+                heads=args.heads,
+                num_landmarks=args.num_landmarks,
+                attn_dropout=args.attn_dropout,
+                pinv_iterations=args.pinv_iterations,
+            ).to(device)
 
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+            )
 
-        # ----- 고정 epoch 학습 -----
-        for epoch in range(1, args.epochs + 1):
-            loss = train_one_epoch(model, train_loader, optimizer, device)
-            print(f"[Fold {fold_idx+1}] Epoch {epoch}/{args.epochs} | Loss: {loss:.4f}")
+            # ----- 고정 epoch 학습 -----
+            for epoch in range(1, args.epochs + 1):
+                loss = train_one_epoch(model, train_loader, optimizer, device)
+                print(f"[Fold {fold_idx+1}] Epoch {epoch}/{args.epochs} | Loss: {loss:.4f}")
 
-        # ----- Test + 결과 저장 -----
-        model.eval()
-        with torch.no_grad():
-            for feats, labels, paths in test_loader:
-                feats = feats.to(device)
-                labels = labels.to(device)
+            # ----- Test + 결과 저장 -----
+            model.eval()
+            with torch.no_grad():
+                for feats, labels, paths in test_loader:
+                    feats = feats.to(device)
+                    labels = labels.to(device)
 
-                out = model(data=feats, return_features=True)
-                probs = out["Y_prob"][:, 1]   # positive class prob
-                preds = out["Y_hat"]
-                attn = out["attn"]            # [1, N]
-                feat_vec = out["feat"]        # [1, embed_dim]
+                    out = model(data=feats, return_features=True)
+                    probs = out["Y_prob"][:, 1]   # positive class prob
+                    preds = out["Y_hat"]
+                    attn = out["attn"]            # [1, N]
+                    feat_vec = out["feat"]        # [1, embed_dim]
 
-                slide_path = paths[0]
-                slide_name = os.path.splitext(os.path.basename(slide_path))[0]
+                    slide_path = paths[0]
+                    slide_name = os.path.splitext(os.path.basename(slide_path))[0]
 
-                label_int = int(labels.item())
-                pred_int = int(preds.item())
-                prob_pos = float(probs.item())
+                    label_int = int(labels.item())
+                    pred_int = int(preds.item())
+                    prob_pos = float(probs.item())
 
-                # result.csv 기록
-                writer.writerow([slide_name, label_int, pred_int, prob_pos])
+                    # result.csv 기록
+                    writer.writerow([slide_name, label_int, pred_int, prob_pos])
 
-                # global metric 용
-                all_labels.append(label_int)
-                all_probs.append(prob_pos)
-                all_preds.append(pred_int)
+                    # global metric 용
+                    all_labels.append(label_int)
+                    all_probs.append(prob_pos)
+                    all_preds.append(pred_int)
 
-                # attention 저장 (patch별 score)
-                attn_np = attn.squeeze(0).cpu().numpy()    # [N]
-                np.save(os.path.join(attn_dir, f"{slide_name}.npy"), attn_np)
+                    # attention 저장 (patch별 score)
+                    attn_np = attn.squeeze(0).cpu().numpy()    # [N]
+                    np.save(os.path.join(attn_dir, f"{slide_name}.npy"), attn_np)
 
-                # pred 직전 layer feature 저장 (cls token)
-                feat_np = feat_vec.squeeze(0).cpu().numpy()  # [embed_dim]
-                np.save(os.path.join(vec_dir, f"{slide_name}.npy"), feat_np)
-
-    csv_f.close()
+                    # pred 직전 layer feature 저장 (cls token)
+                    feat_np = feat_vec.squeeze(0).cpu().numpy()  # [embed_dim]
+                    np.save(os.path.join(vec_dir, f"{slide_name}.npy"), feat_np)
 
     # ================== 전체 LOOCV 성능 ==================
     all_labels = np.array(all_labels)
@@ -445,7 +469,8 @@ def parse_args():
 
     # etc
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--gpu", type=int, default=0, help="GPU index (cuda일 때만 사용)")
 
     return parser.parse_args()
 
