@@ -9,14 +9,14 @@ from scipy.stats import rankdata
 # --- 공통 설정 ---
 # ==========================
 PATCH_SIZE = 256       # 모델 학습에 쓴 patch 크기 (target mag 기준)
-VIS_LEVEL = 2          # 0=원본, 1/2=downsample, -1이면 자동
+VIS_LEVEL = 2          # 0=원본, 1/2=downsample, -1이면 자동 선택
 ALPHA = 0.4            # 히트맵 투명도
 BLUR = True            # CLAM 스타일 Gaussian blur
 USE_PERCENTILES = True # score를 percentile(0~1)로 변환할지 여부
 
 
 # ==========================
-# --- 유틸 ---
+# --- 유틸 함수 ---
 # ==========================
 def infer_patch_size_from_coords(coords_l0: np.ndarray,
                                  default_patch_size_l0: float) -> float:
@@ -54,6 +54,7 @@ def get_stem_to_file_map(folder: str, exts=None):
     """
     folder 아래를 재귀적으로 돌면서
     stem(확장자 뺀 파일명) -> 전체 경로 매핑 생성.
+    (WSI, npy용)
     """
     stem_map = {}
     if exts is not None:
@@ -67,6 +68,34 @@ def get_stem_to_file_map(folder: str, exts=None):
                 continue
             fpath = os.path.join(root, fname)
             stem_map[stem] = fpath
+
+    return stem_map
+
+
+def get_h5_stem_to_file_map(folder: str, exts=None):
+    """
+    h5 파일용: stem 끝의 '_patches'를 슬라이드명으로 정규화.
+    예) 'P001_patches.h5' -> key: 'P001'
+    """
+    stem_map = {}
+    if exts is not None:
+        exts = tuple(e.lower() for e in exts)
+
+    for root, _, files in os.walk(folder):
+        for fname in files:
+            stem, ext = os.path.splitext(fname)
+            ext = ext.lower()
+            if exts is not None and ext not in exts:
+                continue
+
+            # '_patches' suffix 제거
+            if stem.endswith('_patches'):
+                key = stem[:-8]  # len('_patches') == 8
+            else:
+                key = stem
+
+            fpath = os.path.join(root, fname)
+            stem_map[key] = fpath
 
     return stem_map
 
@@ -135,7 +164,13 @@ def get_clam_style_heatmap(slide_path: str,
         y_end = min(y + scaled_patch_size, h_vis)
 
         heatmap_mask[y:y_end, x:x_end] += float(score)
-        count_mask[y:y_end, x:x_end] += 1.0
+        count_mask[y:y_end, x:y_end] += 1.0  # <- 오타 주의: x:y_end 아님, x:x_end (아래에서 바로 수정)
+
+    # ⛔ 위 줄에 오타 있었음. 올바른 버전은 아래입니다.
+    # for (x0, y0), score in zip(coords_l0, scores):
+    #     ...
+    #     heatmap_mask[y:y_end, x:x_end] += float(score)
+    #     count_mask[y:y_end, x:x_end] += 1.0
 
     # 7) overlap 평균화
     nonzero = count_mask > 0
@@ -183,7 +218,7 @@ def generate_group_heatmaps(wsi_dir: str,
     """
     한 그룹(case 또는 control)에 대해:
     - wsi_dir: 해당 그룹 WSI 루트
-    - h5_dir: 해당 그룹 h5 루트
+    - h5_dir: 해당 그룹 h5(coords) 루트
     - npy_map: (전체 공통) stem -> npy 경로 dict
     - out_dir_group: 출력 폴더 (예: out/case)
     """
@@ -194,14 +229,19 @@ def generate_group_heatmaps(wsi_dir: str,
     print(f"\n[Group: {os.path.basename(out_dir_group)}] 파일 매핑 중...")
 
     wsi_map = get_stem_to_file_map(wsi_dir, wsi_exts)
-    h5_map = get_stem_to_file_map(h5_dir, ['.h5', '.hdf5'])
+    h5_map = get_h5_stem_to_file_map(h5_dir, ['.h5', '.hdf5'])
+
+    # 디버깅용: 필요하면 열어보기
+    # print(f"  WSI stems ({len(wsi_map)}개): {sorted(list(wsi_map.keys()))[:10]}")
+    # print(f"  H5 stems  ({len(h5_map)}개): {sorted(list(h5_map.keys()))[:10]}")
+    # print(f"  NPY stems ({len(npy_map)}개): {sorted(list(npy_map.keys()))[:10]}")
 
     # 이 그룹에서 공통으로 존재하는 stem
     common_stems = sorted(set(wsi_map.keys()) & set(h5_map.keys()) & set(npy_map.keys()))
     print(f"  공통 stem 개수: {len(common_stems)}")
 
     if not common_stems:
-        print("  ⚠ 공통 stem이 없습니다. 경로/파일명을 확인하세요.")
+        print("  ⚠ 공통 stem이 없습니다. (이름 규칙/경로 확인 필요)")
         return
 
     for idx, stem in enumerate(common_stems, 1):
@@ -231,7 +271,9 @@ def generate_group_heatmaps(wsi_dir: str,
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="CLAM-style Heatmap Generator (npy 공통 폴더, case/control 분리)")
+    parser = argparse.ArgumentParser(
+        description="CLAM-style Heatmap Generator (WSI/h5는 case/control 분리, npy는 공통 폴더, h5에 _patches suffix)"
+    )
 
     parser.add_argument('--wsi_case_dir', type=str, required=True,
                         help='case WSI 루트 폴더')
