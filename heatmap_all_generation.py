@@ -88,7 +88,6 @@ def get_h5_stem_to_file_map(folder: str, exts=None):
             if exts is not None and ext not in exts:
                 continue
 
-            # '_patches' suffix 제거
             if stem.endswith('_patches'):
                 key = stem[:-8]  # len('_patches') == 8
             else:
@@ -101,32 +100,34 @@ def get_h5_stem_to_file_map(folder: str, exts=None):
 
 
 # ==========================
-# --- 핵심: CLAM 스타일 히트맵 ---
+# --- CLAM 스타일 히트맵 (단일 슬라이드 로직 이식) ---
 # ==========================
 def get_clam_style_heatmap(slide_path: str,
                            coords_path: str,
                            scores_path: str,
                            output_path: str):
     print(f"\n=== Processing: {os.path.basename(slide_path)} ===")
+    print("Loading slide and coordinates...")
 
-    # 1) 슬라이드 / coords / scores 로드
     slide = openslide.OpenSlide(slide_path)
 
     with h5py.File(coords_path, 'r') as f:
-        coords = f['coords'][:]  # (N, 2)
+        coords = f['coords'][:]   # (N, 2)
 
-    scores = np.load(scores_path).astype(np.float32)
-    scores = scores.flatten()
+    scores = np.load(scores_path)
+    if scores.ndim > 1:
+        scores = scores.flatten()
 
-    assert len(coords) == len(scores), f"coords({len(coords)}) != scores({len(scores)})"
+    assert len(coords) == len(scores), f"Coords({len(coords)})와 Scores({len(scores)}) 개수가 안 맞음!"
 
-    # 2) score 정규화
+    # 1) 점수 정규화 (CLAM 스타일)
     if USE_PERCENTILES:
-        scores = rankdata(scores) / len(scores)  # 0~1
+        print("Converting scores to percentiles (CLAM Style)...")
+        scores = rankdata(scores) / len(scores)  # 0~1로 스케일
     else:
         scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
 
-    # 3) 시각화 level 선택
+    # 2) 시각화 level 결정
     if VIS_LEVEL < 0:
         best_level = slide.level_count - 1
         for i in range(slide.level_count):
@@ -139,20 +140,26 @@ def get_clam_style_heatmap(slide_path: str,
 
     w_vis, h_vis = slide.level_dimensions[vis_level]
     ds_vis = float(slide.level_downsamples[vis_level])
-    print(f"[INFO] vis_level={vis_level}, size={w_vis}x{h_vis}, ds={ds_vis}")
+    print(f"Visualization Level: {vis_level} (Size: {w_vis}x{h_vis}, DS: {ds_vis})")
 
-    coords_l0 = coords.astype(np.float32)  # Trident coords: level-0 기준
+    # 3) Trident coords는 이미 Level 0 기준 → scale = 1.0
+    coord_to_level0 = 1.0
+    coords_l0 = coords.astype(np.float32) * coord_to_level0
 
-    # 4) patch size 추정 및 vis_level 기준 scaling
-    patch_size_l0 = infer_patch_size_from_coords(coords_l0, PATCH_SIZE)
+    # 4) Level 0에서 patch 크기 추정
+    patch_size_l0 = PATCH_SIZE * coord_to_level0
+    patch_size_l0 = infer_patch_size_from_coords(coords_l0, patch_size_l0)
+
+    # vis_level 기준으로 스케일링
     scaled_patch_size = max(1, int(round(patch_size_l0 / ds_vis)))
-    print(f"[DEBUG] scaled_patch_size={scaled_patch_size}")
+    print(f"[DEBUG] patch_size_l0={patch_size_l0}, scaled_patch_size={scaled_patch_size}")
 
-    # 5) heatmap / count mask 준비
+    # 5) 히트맵 캔버스 준비
+    print("Drawing heatmap mask...")
     heatmap_mask = np.zeros((h_vis, w_vis), dtype=np.float32)
     count_mask = np.zeros((h_vis, w_vis), dtype=np.float32)
 
-    # 6) 각 패치에 score 채우기
+    # 6) 패치마다 score 채우기
     for (x0, y0), score in zip(coords_l0, scores):
         x = int(x0 / ds_vis)
         y = int(y0 / ds_vis)
@@ -164,48 +171,46 @@ def get_clam_style_heatmap(slide_path: str,
         y_end = min(y + scaled_patch_size, h_vis)
 
         heatmap_mask[y:y_end, x:x_end] += float(score)
-        count_mask[y:y_end, x:y_end] += 1.0  # <- 오타 주의: x:y_end 아님, x:x_end (아래에서 바로 수정)
+        count_mask[y:y_end, x:x_end] += 1.0
 
-    # ⛔ 위 줄에 오타 있었음. 올바른 버전은 아래입니다.
-    # for (x0, y0), score in zip(coords_l0, scores):
-    #     ...
-    #     heatmap_mask[y:y_end, x:x_end] += float(score)
-    #     count_mask[y:y_end, x:x_end] += 1.0
-
-    # 7) overlap 평균화
+    # 7) overlap 있으면 평균 내기
     nonzero = count_mask > 0
     heatmap_mask[nonzero] /= count_mask[nonzero]
     heatmap_mask[~nonzero] = 0.0
 
-    # 8) 0~255로 스케일링
+    # 8) 0~255로 정규화
     if heatmap_mask.max() > 0:
         heatmap_norm = (heatmap_mask / heatmap_mask.max()) * 255.0
     else:
         heatmap_norm = heatmap_mask * 0
     heatmap_uint8 = heatmap_norm.astype(np.uint8)
 
-    # 9) Gaussian blur (CLAM 느낌)
+    # 9) 블러 처리 (CLAM 스타일)
     if BLUR:
-        k_size = max(3, (scaled_patch_size * 2) | 1)  # 홀수
+        k_size = max(3, (scaled_patch_size * 2) | 1)
         print(f"[DEBUG] GaussianBlur ksize={k_size}")
         heatmap_uint8 = cv2.GaussianBlur(heatmap_uint8, (k_size, k_size), 0)
 
-    # 10) 컬러맵 적용
+    # 10) 컬러맵 입히기
     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 11) 원본 이미지 읽기
+    # 11) 조직이 있는 위치만 마스킹 (coords 있었던 곳)
+    tissue_mask = (count_mask > 0).astype(np.uint8)
+
+    # 12) 원본 이미지 읽기
+    print("Overlaying on WSI...")
     original_img = slide.read_region((0, 0), vis_level, (w_vis, h_vis)).convert("RGB")
     original_img = np.array(original_img)
     original_img = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
 
-    # 12) overlay & tissue masking
     overlay = cv2.addWeighted(original_img, 1 - ALPHA, heatmap_color, ALPHA, 0)
-    tissue_mask = (count_mask > 0).astype(np.uint8)
+
+    # 조직 없는 부분은 원본만 남기기
     idx_bg = np.where(tissue_mask == 0)
     overlay[idx_bg] = original_img[idx_bg]
 
     cv2.imwrite(output_path, overlay)
-    print(f"[SAVED] {output_path}")
+    print(f"Saved heatmap to: {output_path}")
 
 
 # ==========================
@@ -231,12 +236,6 @@ def generate_group_heatmaps(wsi_dir: str,
     wsi_map = get_stem_to_file_map(wsi_dir, wsi_exts)
     h5_map = get_h5_stem_to_file_map(h5_dir, ['.h5', '.hdf5'])
 
-    # 디버깅용: 필요하면 열어보기
-    # print(f"  WSI stems ({len(wsi_map)}개): {sorted(list(wsi_map.keys()))[:10]}")
-    # print(f"  H5 stems  ({len(h5_map)}개): {sorted(list(h5_map.keys()))[:10]}")
-    # print(f"  NPY stems ({len(npy_map)}개): {sorted(list(npy_map.keys()))[:10]}")
-
-    # 이 그룹에서 공통으로 존재하는 stem
     common_stems = sorted(set(wsi_map.keys()) & set(h5_map.keys()) & set(npy_map.keys()))
     print(f"  공통 stem 개수: {len(common_stems)}")
 
