@@ -4,36 +4,37 @@ import openslide
 import h5py
 import numpy as np
 import cv2
-from scipy.stats import rankdata
 from PIL import Image
 
 # =============================================================================
-# [Configuration] 미만성(Diffuse) 질환 & 논문용 최적화 설정
+# [Configuration] 연구 목적에 맞춘 하이퍼파라미터
 # =============================================================================
 CONF = {
-    'PATCH_SIZE': 256,       # 학습 시 Patch Size (256 or 512)
-    'VIS_LEVEL': -1,         # -1: 자동 (메모리 아끼면서 적절한 해상도 찾음)
+    'PATCH_SIZE': 256,       # 학습 시 Patch Size (Target Magnification 기준)
+    'VIS_LEVEL': -1,         # -1: 자동 (메모리 효율 고려하여 적절한 해상도 선택)
     'ALPHA': 0.4,            # 히트맵 투명도 (0.4 ~ 0.5 추천)
-    'USE_RANK': False,       # [중요] False로 설정 (Diffuse 병변은 Rank 쓰면 안됨)
-    'BLUR_FACTOR': 4.0,      # [중요] 흐림 강도 (기본 2.0 -> 4.0으로 UP for Diffuse look)
-    'TEXT_INFO': True,       # 이미지 구석에 Max Score 적을지 여부 (Control 방어용)
-    'SCORE_THRES': 0.0,      # (선택) 이 점수 이하는 아예 투명하게 날림 (노이즈 제거용, 예: 0.1)
+    
+    # [중요] Diffuse 질환 시각화 핵심 설정
+    'BLUR_FACTOR': 4.0,      # 높을수록 구름처럼 몽글몽글해짐 (기본 2.0 -> 4.0 상향)
+    'CLIP_PCT': (2, 98),     # Logit의 이상치(Outlier) 제거 범위 (하위 2%, 상위 98%)
+    'BG_THRESH': 0.1,        # 정규화된 점수가 이 값 미만이면 투명하게 날림 (노이즈 제거)
+    
+    # [중요] 논문 방어용 텍스트
+    'TEXT_INFO': True,       # 이미지 구석에 Raw Max Score 표기 여부
 }
 
 # =============================================================================
-# [Utils]
+# [Helper Functions]
 # =============================================================================
 def get_file_map(folder, exts):
-    """폴더 내 파일 매핑 (stem -> path)"""
+    """폴더 내 파일 재귀 탐색 및 매핑 (Stem -> Path)"""
     fmap = {}
     if exts: exts = tuple(e.lower() for e in exts)
     for root, _, files in os.walk(folder):
         for fname in files:
             stem, ext = os.path.splitext(fname)
             if exts and ext.lower() not in exts: continue
-            
-            # h5 파일명 정규화 (_patches 제거)
-            if stem.endswith('_patches'): stem = stem[:-8]
+            if stem.endswith('_patches'): stem = stem[:-8] # h5 이름 정규화
             fmap[stem] = os.path.join(root, fname)
     return fmap
 
@@ -45,39 +46,36 @@ def infer_patch_size(coords, default_size):
     dx = np.min(np.diff(xs)) if len(xs) > 1 else default_size
     dy = np.min(np.diff(ys)) if len(ys) > 1 else default_size
     inferred = float(max(dx, dy))
-    
-    # 터무니없는 값이면 default 사용
     if inferred < default_size * 0.5 or inferred > default_size * 2.0:
         return default_size
     return inferred
 
-def normalize_scores(scores):
+def normalize_logits(logits):
     """
-    [핵심 로직]
-    Diffuse 병변을 위해 Min-Max Scaling 사용.
-    Control 군의 낮은 점수를 그대로 반영하기 위해 Rank는 끔.
+    [핵심 알고리즘] Robust Min-Max Scaling for Logits
+    - Softmax를 쓰지 않은 Logit은 범위가 제멋대로임 (-inf ~ inf)
+    - 그냥 Min-Max를 하면 튀는 값 하나 때문에 전체가 흐려짐
+    - 따라서 Percentile Clipping 후 Min-Max를 적용함
     """
-    raw_min, raw_max = scores.min(), scores.max()
+    # 1. 이상치(Outlier) Clipping
+    lower = np.percentile(logits, CONF['CLIP_PCT'][0])
+    upper = np.percentile(logits, CONF['CLIP_PCT'][1])
+    clipped = np.clip(logits, lower, upper)
     
-    if CONF['USE_RANK']:
-        # 기존 방식 (Focal 병변용)
-        norm_scores = rankdata(scores) / len(scores)
+    # 2. Min-Max Scaling
+    denom = upper - lower
+    if denom < 1e-9:
+        norm = np.zeros_like(logits)
     else:
-        # 개선 방식 (Diffuse 병변용)
-        # 점수 차이가 거의 없으면(0으로 나눔 방지) 그냥 0 처리
-        if (raw_max - raw_min) < 1e-9:
-            norm_scores = np.zeros_like(scores)
-        else:
-            norm_scores = (scores - raw_min) / (raw_max - raw_min)
-            
-        # (선택) 노이즈 제거: 너무 낮은 점수는 아예 0으로
-        if CONF['SCORE_THRES'] > 0:
-            norm_scores[norm_scores < CONF['SCORE_THRES']] = 0
-
-    return norm_scores, raw_max
+        norm = (clipped - lower) / denom
+        
+    # 3. Background Noise Cutoff
+    norm[norm < CONF['BG_THRESH']] = 0.0
+    
+    return norm, logits.max(), logits.min()
 
 # =============================================================================
-# [Core Visualization]
+# [Core Visualization Logic]
 # =============================================================================
 def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     print(f"\nProcessing: {os.path.basename(slide_path)}")
@@ -90,79 +88,88 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
         scores = np.load(scores_path)
         if scores.ndim > 1: scores = scores.flatten()
     except Exception as e:
-        print(f"[Error] Load failed: {e}")
+        print(f"  [Error] Load failed: {e}")
         return
 
-    # 2. Normalize Scores (Min-Max)
-    norm_scores, raw_max_score = normalize_scores(scores)
+    # 2. Normalize (Logit Optimized)
+    norm_scores, raw_max, raw_min = normalize_logits(scores)
     
-    # 3. Determine Vis Level
+    # 3. Determine Visualization Level
     vis_level = CONF['VIS_LEVEL']
     if vis_level < 0:
         vis_level = slide.level_count - 1
         for i in range(slide.level_count):
-            # 너무 작지 않은 적당한 해상도(width < 5000) 선택
-            if slide.level_dimensions[i][0] < 5000:
+            if slide.level_dimensions[i][0] < 5000: # 적절한 해상도 제한
                 vis_level = i
                 break
     
     w_vis, h_vis = slide.level_dimensions[vis_level]
     ds = slide.level_downsamples[vis_level]
-    print(f"  - Level: {vis_level} ({w_vis}x{h_vis}), Max Score: {raw_max_score:.4f}")
-
-    # 4. Infer Patch Size & Scaling
+    
+    # 4. Patch Size Calculation
     patch_size_l0 = infer_patch_size(coords, CONF['PATCH_SIZE'])
     scaled_patch_size = max(1, int(patch_size_l0 / ds))
     
-    # 5. Draw Masks
+    print(f"  - Level: {vis_level} ({w_vis}x{h_vis}), Patch: {scaled_patch_size}px")
+    print(f"  - Logit Range: {raw_min:.4f} ~ {raw_max:.4f}")
+
+    # 5. Create Masks
     heatmap = np.zeros((h_vis, w_vis), dtype=np.float32)
     count_map = np.zeros((h_vis, w_vis), dtype=np.float32)
-    
     coords_vis = (coords / ds).astype(np.int32)
     
-    # Vectorized operation is hard for overlay, using loop (safe & clear)
+    # 6. Fill Patches
     for (x, y), score in zip(coords_vis, norm_scores):
         if x >= w_vis or y >= h_vis: continue
         xe, ye = min(x + scaled_patch_size, w_vis), min(y + scaled_patch_size, h_vis)
+        
         heatmap[y:ye, x:xe] += score
         count_map[y:ye, x:xe] += 1
 
-    # Average overlapping patches
+    # 7. Average Overlaps
     mask = count_map > 0
     heatmap[mask] /= count_map[mask]
     
-    # 6. Apply Blur (Diffuse Style)
-    # 팩터를 4.0으로 키워서 '구름'처럼 뭉개버림
+    # 8. Apply Strong Blur (Cloud Effect for Diffuse Lesion)
     heatmap_u8 = (heatmap * 255).astype(np.uint8)
     k_size = int(scaled_patch_size * CONF['BLUR_FACTOR']) | 1 
-    sigma = k_size // 3
+    sigma = k_size // 3 # Sigma를 크게 주어 부드럽게 퍼지게 함
     heatmap_u8 = cv2.GaussianBlur(heatmap_u8, (k_size, k_size), sigma)
     
-    # 7. Apply ColorMap (Jet is standard)
+    # 9. Apply ColorMap (Jet)
     heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
     
-    # 8. Overlay
-    region = slide.read_region((0,0), vis_level, (w_vis, h_vis)).convert("RGB")
-    original = np.array(region)
-    original = cv2.cvtColor(original, cv2.COLOR_RGB2BGR) # PIL(RGB) -> cv2(BGR)
+    # 10. Overlay on WSI
+    # RGBA로 읽어서 흰 배경 처리
+    region = slide.read_region((0,0), vis_level, (w_vis, h_vis))
+    if region.mode == 'RGBA':
+        bg = Image.new("RGBA", region.size, (255, 255, 255, 255))
+        region = Image.alpha_composite(bg, region)
+    original = cv2.cvtColor(np.array(region.convert("RGB")), cv2.COLOR_RGB2BGR)
     
-    # Tissue Mask가 있는 곳만 색칠 (배경 흰색 유지)
-    # count_map이 있는 곳이 곧 tissue (patch가 추출된 곳)
+    # 조직이 있는 부분(mask)에만 히트맵 합성
+    overlay = original.copy()
+    
+    # 마스크도 블러를 살짝 먹여서 경계선을 부드럽게 처리 (선택사항)
+    # 여기서는 count_map이 0보다 큰 곳(조직)만 정확히 칠함
     tissue_mask_vis = count_map > 0
     
-    overlay = original.copy()
     blended = cv2.addWeighted(original, 1 - CONF['ALPHA'], heatmap_color, CONF['ALPHA'], 0)
     overlay[tissue_mask_vis] = blended[tissue_mask_vis]
 
-    # 9. [Optional] Add Score Text (논문 방어용)
+    # 11. Add Raw Score Text (Critical for Paper Defense)
     if CONF['TEXT_INFO']:
-        text = f"Max Attention: {raw_max_score:.4f}"
-        # 점수가 낮으면(Control) 초록색 글씨, 높으면 빨간 글씨
-        txt_color = (0, 200, 0) if raw_max_score < 0.1 else (0, 0, 255)
-        cv2.putText(overlay, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                    1.5, txt_color, 3, cv2.LINE_AA)
+        text = f"Raw Max Logit: {raw_max:.2f}"
+        # 점수가 낮으면(Control 추정) 초록색, 높으면 빨간색
+        # Logit 기준이라 절대적인 Threshold는 실험적으로 판단 (예: 0.0 기준)
+        color = (0, 180, 0) if raw_max < 0.0 else (0, 0, 255) 
+        
+        cv2.putText(overlay, text, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                    1.2, (255,255,255), 5, cv2.LINE_AA) # 흰 테두리
+        cv2.putText(overlay, text, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                    1.2, color, 2, cv2.LINE_AA)       # 글씨
 
-    # 10. Save
+    # 12. Save
     cv2.imwrite(out_path, overlay)
     print(f"  - Saved: {out_path}")
 
@@ -170,18 +177,20 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
 # [Main Executor]
 # =============================================================================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--wsi_case', type=str, required=True)
-    parser.add_argument('--wsi_control', type=str, required=True)
-    parser.add_argument('--h5_case', type=str, required=True)
-    parser.add_argument('--h5_control', type=str, required=True)
-    parser.add_argument('--npy_dir', type=str, required=True)
-    parser.add_argument('--out_dir', type=str, required=True)
+    parser = argparse.ArgumentParser(description="Diffuse Disease Heatmap Generator (Logit Optimized)")
+    parser.add_argument('--wsi_case', type=str, required=True, help="Case WSI Folder")
+    parser.add_argument('--wsi_control', type=str, required=True, help="Control WSI Folder")
+    parser.add_argument('--h5_case', type=str, required=True, help="Case Coords Folder")
+    parser.add_argument('--h5_control', type=str, required=True, help="Control Coords Folder")
+    parser.add_argument('--npy_dir', type=str, required=True, help="Attention Scores (.npy) Folder")
+    parser.add_argument('--out_dir', type=str, required=True, help="Output Folder")
     args = parser.parse_args()
 
-    # 1. Map Files
+    # 1. Map NPY Files (Common)
     npy_map = get_file_map(args.npy_dir, ['.npy'])
-    
+    print(f"[Init] Found {len(npy_map)} attention score files.")
+
+    # 2. Process Groups
     groups = [
         ('case', args.wsi_case, args.h5_case),
         ('control', args.wsi_control, args.h5_control)
@@ -191,13 +200,20 @@ if __name__ == '__main__':
         wsi_map = get_file_map(wsi_d, ['.svs', '.tif', '.ndpi', '.mrxs', '.bif'])
         h5_map = get_file_map(h5_d, ['.h5'])
         
-        # 교집합 찾기
-        common = sorted(set(wsi_map.keys()) & set(h5_map.keys()) & set(npy_map.keys()))
-        print(f"\n[Group: {grp_name}] Found {len(common)} slides.")
+        # 교집합 파일만 처리
+        common_stems = sorted(set(wsi_map.keys()) & set(h5_map.keys()) & set(npy_map.keys()))
+        print(f"\n[Group: {grp_name.upper()}] Matched {len(common_stems)} slides.")
         
         out_grp = os.path.join(args.out_dir, grp_name)
         os.makedirs(out_grp, exist_ok=True)
         
-        for stem in common:
-            draw_heatmap(wsi_map[stem], h5_map[stem], npy_map[stem], 
-                         os.path.join(out_grp, f"{stem}.jpg"))
+        for stem in common_stems:
+            try:
+                draw_heatmap(
+                    slide_path=wsi_map[stem], 
+                    coords_path=h5_map[stem], 
+                    scores_path=npy_map[stem], 
+                    out_path=os.path.join(out_grp, f"{stem}.jpg")
+                )
+            except Exception as e:
+                print(f"[Error] Failed on {stem}: {e}")
