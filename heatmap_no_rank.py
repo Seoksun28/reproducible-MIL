@@ -20,7 +20,7 @@ CONF = {
     'BG_THRESH': 0.1,        # 정규화된 점수가 이 값 미만이면 투명하게 날림 (노이즈 제거)
     
     # [중요] 논문 방어용 텍스트
-    'TEXT_INFO': True,       # 이미지 구석에 Raw Max Score 표기 여부
+    'TEXT_INFO': True,       # 이미지 구석에 Raw Logit 통계(μ, σ) 표기 여부
 }
 
 # =============================================================================
@@ -33,14 +33,17 @@ def get_file_map(folder, exts):
     for root, _, files in os.walk(folder):
         for fname in files:
             stem, ext = os.path.splitext(fname)
-            if exts and ext.lower() not in exts: continue
-            if stem.endswith('_patches'): stem = stem[:-8] # h5 이름 정규화
+            if exts and ext.lower() not in exts:
+                continue
+            if stem.endswith('_patches'):
+                stem = stem[:-8]  # h5 이름 정규화
             fmap[stem] = os.path.join(root, fname)
     return fmap
 
 def infer_patch_size(coords, default_size):
     """좌표 간격으로 실제 Patch Size 추론"""
-    if len(coords) < 2: return default_size
+    if len(coords) < 2:
+        return default_size
     xs = np.sort(np.unique(coords[:, 0]))
     ys = np.sort(np.unique(coords[:, 1]))
     dx = np.min(np.diff(xs)) if len(xs) > 1 else default_size
@@ -57,6 +60,14 @@ def normalize_logits(logits):
     - 그냥 Min-Max를 하면 튀는 값 하나 때문에 전체가 흐려짐
     - 따라서 Percentile Clipping 후 Min-Max를 적용함
     """
+    logits = np.asarray(logits, dtype=np.float32)
+
+    # 통계값은 클리핑 이전의 raw logit 기준으로 계산
+    raw_max = float(np.max(logits))
+    raw_min = float(np.min(logits))
+    raw_mean = float(np.mean(logits))
+    raw_std = float(np.std(logits))
+
     # 1. 이상치(Outlier) Clipping
     lower = np.percentile(logits, CONF['CLIP_PCT'][0])
     upper = np.percentile(logits, CONF['CLIP_PCT'][1])
@@ -72,7 +83,7 @@ def normalize_logits(logits):
     # 3. Background Noise Cutoff
     norm[norm < CONF['BG_THRESH']] = 0.0
     
-    return norm, logits.max(), logits.min()
+    return norm, raw_max, raw_min, raw_mean, raw_std
 
 # =============================================================================
 # [Core Visualization Logic]
@@ -86,20 +97,21 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
         with h5py.File(coords_path, 'r') as f:
             coords = f['coords'][:]
         scores = np.load(scores_path)
-        if scores.ndim > 1: scores = scores.flatten()
+        if scores.ndim > 1:
+            scores = scores.flatten()
     except Exception as e:
         print(f"  [Error] Load failed: {e}")
         return
 
     # 2. Normalize (Logit Optimized)
-    norm_scores, raw_max, raw_min = normalize_logits(scores)
+    norm_scores, raw_max, raw_min, raw_mean, raw_std = normalize_logits(scores)
     
     # 3. Determine Visualization Level
     vis_level = CONF['VIS_LEVEL']
     if vis_level < 0:
         vis_level = slide.level_count - 1
         for i in range(slide.level_count):
-            if slide.level_dimensions[i][0] < 5000: # 적절한 해상도 제한
+            if slide.level_dimensions[i][0] < 5000:  # 적절한 해상도 제한
                 vis_level = i
                 break
     
@@ -110,8 +122,11 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     patch_size_l0 = infer_patch_size(coords, CONF['PATCH_SIZE'])
     scaled_patch_size = max(1, int(patch_size_l0 / ds))
     
-    print(f"  - Level: {vis_level} ({w_vis}x{h_vis}), Patch: {scaled_patch_size}px")
-    print(f"  - Logit Range: {raw_min:.4f} ~ {raw_max:.4f}")
+    print(
+        f"  - Level: {vis_level} ({w_vis}x{h_vis}), Patch: {scaled_patch_size}px\n"
+        f"  - Logit Range: {raw_min:.4f} ~ {raw_max:.4f}, "
+        f"mean={raw_mean:.4f}, std={raw_std:.4f}"
+    )
 
     # 5. Create Masks
     heatmap = np.zeros((h_vis, w_vis), dtype=np.float32)
@@ -120,7 +135,8 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     
     # 6. Fill Patches
     for (x, y), score in zip(coords_vis, norm_scores):
-        if x >= w_vis or y >= h_vis: continue
+        if x >= w_vis or y >= h_vis:
+            continue
         xe, ye = min(x + scaled_patch_size, w_vis), min(y + scaled_patch_size, h_vis)
         
         heatmap[y:ye, x:xe] += score
@@ -133,7 +149,7 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     # 8. Apply Strong Blur (Cloud Effect for Diffuse Lesion)
     heatmap_u8 = (heatmap * 255).astype(np.uint8)
     k_size = int(scaled_patch_size * CONF['BLUR_FACTOR']) | 1 
-    sigma = k_size // 3 # Sigma를 크게 주어 부드럽게 퍼지게 함
+    sigma = k_size // 3  # Sigma를 크게 주어 부드럽게 퍼지게 함
     heatmap_u8 = cv2.GaussianBlur(heatmap_u8, (k_size, k_size), sigma)
     
     # 9. Apply ColorMap (Jet)
@@ -141,7 +157,7 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     
     # 10. Overlay on WSI
     # RGBA로 읽어서 흰 배경 처리
-    region = slide.read_region((0,0), vis_level, (w_vis, h_vis))
+    region = slide.read_region((0, 0), vis_level, (w_vis, h_vis))
     if region.mode == 'RGBA':
         bg = Image.new("RGBA", region.size, (255, 255, 255, 255))
         region = Image.alpha_composite(bg, region)
@@ -150,24 +166,29 @@ def draw_heatmap(slide_path, coords_path, scores_path, out_path):
     # 조직이 있는 부분(mask)에만 히트맵 합성
     overlay = original.copy()
     
-    # 마스크도 블러를 살짝 먹여서 경계선을 부드럽게 처리 (선택사항)
     # 여기서는 count_map이 0보다 큰 곳(조직)만 정확히 칠함
     tissue_mask_vis = count_map > 0
     
     blended = cv2.addWeighted(original, 1 - CONF['ALPHA'], heatmap_color, CONF['ALPHA'], 0)
     overlay[tissue_mask_vis] = blended[tissue_mask_vis]
 
-    # 11. Add Raw Score Text (Critical for Paper Defense)
+    # 11. Add Raw Logit Stats Text (논문 방어용)
     if CONF['TEXT_INFO']:
-        text = f"Raw Max Logit: {raw_max:.2f}"
-        # 점수가 낮으면(Control 추정) 초록색, 높으면 빨간색
-        # Logit 기준이라 절대적인 Threshold는 실험적으로 판단 (예: 0.0 기준)
-        color = (0, 180, 0) if raw_max < 0.0 else (0, 0, 255) 
+        # 예: "Logit μ=0.85, σ=0.32"
+        text = f"Logit μ={raw_mean:.2f}, σ={raw_std:.2f}"
+        # mean 기준으로 색 구분 (control/low: 초록, case/high: 빨강 느낌)
+        color = (0, 180, 0) if raw_mean < 0.0 else (0, 0, 255)
         
-        cv2.putText(overlay, text, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                    1.2, (255,255,255), 5, cv2.LINE_AA) # 흰 테두리
-        cv2.putText(overlay, text, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                    1.2, color, 2, cv2.LINE_AA)       # 글씨
+        cv2.putText(
+            overlay, text, (30, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+            (255, 255, 255), 5, cv2.LINE_AA  # 흰 테두리
+        )
+        cv2.putText(
+            overlay, text, (30, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+            color, 2, cv2.LINE_AA            # 실제 글자색
+        )
 
     # 12. Save
     cv2.imwrite(out_path, overlay)
@@ -210,9 +231,9 @@ if __name__ == '__main__':
         for stem in common_stems:
             try:
                 draw_heatmap(
-                    slide_path=wsi_map[stem], 
-                    coords_path=h5_map[stem], 
-                    scores_path=npy_map[stem], 
+                    slide_path=wsi_map[stem],
+                    coords_path=h5_map[stem],
+                    scores_path=npy_map[stem],
                     out_path=os.path.join(out_grp, f"{stem}.jpg")
                 )
             except Exception as e:
