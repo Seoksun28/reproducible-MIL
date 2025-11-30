@@ -10,7 +10,7 @@ from PIL import Image  # RGBA → 흰 배경 합성용
 # --- 공통 설정 ---
 # ==========================
 PATCH_SIZE = 256       # 모델 학습에 쓴 patch 크기 (target mag 기준)
-VIS_LEVEL = 2          # 0=원본, 1/2=downsample, -1이면 자동 선택
+VIS_LEVEL = -1          # 0=원본, 1/2=downsample, -1이면 자동 선택
 ALPHA = 0.4            # 히트맵 투명도
 BLUR = True            # CLAM 스타일 Gaussian blur
 USE_PERCENTILES = True # score를 percentile(0~1)로 변환할지 여부
