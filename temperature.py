@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from sklearn.calibration import calibration_curve
+
 # ============================
 #  Global
 # ============================
@@ -22,8 +24,8 @@ def set_medical_style():
         "font.size": 14,
         "axes.titlesize": 18,
         "axes.labelsize": 16,
-        "xtick.labelsize": 14,
-        "ytick.labelsize": 14,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
         "legend.fontsize": 13,
         "axes.linewidth": 1.5,
         "axes.grid": True,
@@ -32,7 +34,7 @@ def set_medical_style():
         "grid.color": "#bfbfbf",
         "figure.dpi": 300,
         "savefig.dpi": 300,
-        "lines.linewidth": 2.5,
+        "lines.linewidth": 2.3,
         "axes.spines.top": False,
         "axes.spines.right": False,
     })
@@ -97,70 +99,59 @@ def brier_score(p, y):
 
 
 # ============================
-#  Calibration Plot
+#  Calibration Plot (sklearn.calibration_curve 사용)
 # ============================
-def reliability_curve(p, y, n_bins=10):
+def plot_calibration_sklearn(y_true, p_raw, p_cal, out_path: str, n_bins: int = 10):
     """
-    p: (N,) predicted prob
-    y: (N,) label
-    return: bin_centers, mean_pred, frac_pos
+    sklearn.calibration.calibration_curve(strategy='quantile')를
+    사용해서 Before / After를 같은 방식으로 그림.
     """
-    p = np.asarray(p)
-    y = np.asarray(y)
+    # Before TS
+    prob_true_raw, prob_pred_raw = calibration_curve(
+        y_true, p_raw, n_bins=n_bins, strategy="quantile"
+    )
+    # After TS
+    prob_true_cal, prob_pred_cal = calibration_curve(
+        y_true, p_cal, n_bins=n_bins, strategy="quantile"
+    )
 
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_ids = np.digitize(p, bins) - 1  # 0 ~ n_bins-1
-
-    bin_centers = []
-    bin_mean_pred = []
-    bin_frac_pos = []
-
-    for b in range(n_bins):
-        mask = bin_ids == b
-        if np.sum(mask) == 0:
-            continue
-        bin_p = p[mask]
-        bin_y = y[mask]
-        bin_centers.append(0.5 * (bins[b] + bins[b + 1]))
-        bin_mean_pred.append(np.mean(bin_p))
-        bin_frac_pos.append(np.mean(bin_y))
-
-    return np.array(bin_centers), np.array(bin_mean_pred), np.array(bin_frac_pos)
-
-
-def plot_calibration_medical(y_true, p_raw, p_cal, out_path):
-    """
-    NEJM/JAMA 스타일 Calibration plot
-    - 대각선: Ideal
-    - 동그라미: Before TS
-    - 네모: After TS
-    """
     set_medical_style()
-
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Ideal line
-    ax.plot([0, 1], [0, 1], "--", linewidth=1.5, color="#7a7a7a", label="Ideal")
+    # reference line (perfect calibration)
+    ax.plot([0, 1], [0, 1],
+            linestyle="--", linewidth=1.5, label="Perfect calibration", color="#7a7a7a")
 
     # Before TS
-    _, mean_raw, frac_raw = reliability_curve(p_raw, y_true, n_bins=10)
-    ax.plot(mean_raw, frac_raw, "o-", label="Before TS", color="#003f5c")
+    ax.plot(
+        prob_pred_raw,
+        prob_true_raw,
+        marker="o",
+        linewidth=2.3,
+        label="Before TS",
+        color="#003f5c",
+    )
 
     # After TS
-    _, mean_cal, frac_cal = reliability_curve(p_cal, y_true, n_bins=10)
-    ax.plot(mean_cal, frac_cal, "s-", label="After TS", color="#bc5090")
+    ax.plot(
+        prob_pred_cal,
+        prob_true_cal,
+        marker="s",
+        linewidth=2.3,
+        label="After TS",
+        color="#bc5090",
+    )
 
-    ax.set_xlabel("Predicted Probability")
-    ax.set_ylabel("Observed Proportion")
-    ax.set_title("Calibration Plot (Temperature Scaling)")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.legend(loc="upper left", frameon=False)
-
+    ax.set_xlabel("Predicted probability")
+    ax.set_ylabel("Observed proportion")
+    ax.set_title("Calibration Plot (Before vs After Temperature Scaling)")
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.0])
+    ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"[Calibration] saved → {out_path}")
+    print(f"[Calibration] Saved → {out_path}")
 
 
 # ============================
@@ -210,10 +201,8 @@ def decision_curve_analysis(y_true, y_prob, thresholds=None):
 
 def plot_dca_curve_medical(y_true, y_prob, out_png, out_csv=None):
     """
-    DCA를 임상 저널 스타일로 플로팅 (Temperature Scaling 적용 후 확률 사용)
-    - x축: threshold 0 ~ 0.30
-    - y축: net benefit를 작은 범위로 자동 확대
-    - curves: Model (solid), Treat All (dashed), Treat None (0 baseline)
+    Temperature Scaling 적용된 확률(y_prob)을 사용해서
+    NEJM/JAMA 스타일로 DCA 플롯.
     """
     set_medical_style()
 
@@ -228,7 +217,7 @@ def plot_dca_curve_medical(y_true, y_prob, out_png, out_csv=None):
     # Treat None = 0 baseline
     plt.axhline(0.0, label="Treat None", color="#b3b3b3", linestyle=":", linewidth=2)
 
-    # 축 설정 (0~0.30 확대)
+    # x축 범위
     plt.xlim(thr.min(), thr.max())
 
     # y축을 데이터에 맞춰 좁게 잡기 (약간의 margin 포함)
@@ -246,10 +235,10 @@ def plot_dca_curve_medical(y_true, y_prob, out_png, out_csv=None):
     plt.title("Decision Curve Analysis (Calibrated)")
     plt.legend(frameon=False, loc="upper right")
     plt.tight_layout()
-    plt.savefig(out_png)
+    plt.savefig(out_png, bbox_inches="tight")
     plt.close()
 
-    print(f"[DCA] saved → {out_png}")
+    print(f"[DCA] Saved → {out_png}")
 
     if out_csv:
         df = pd.DataFrame({
@@ -259,7 +248,7 @@ def plot_dca_curve_medical(y_true, y_prob, out_png, out_csv=None):
             "net_benefit_treat_none": nb_n,
         })
         df.to_csv(out_csv, index=False)
-        print(f"[DCA CSV] saved → {out_csv}")
+        print(f"[DCA CSV] Saved → {out_csv}")
 
 
 # ============================
@@ -267,12 +256,14 @@ def plot_dca_curve_medical(y_true, y_prob, out_png, out_csv=None):
 # ============================
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Temperature Scaling + Medical-style Calibration & DCA"
+        description="Temperature Scaling + Medical-style Calibration & DCA (using sklearn.calibration_curve)"
     )
     p.add_argument("--csv_path", type=str, required=True,
                    help="LOOCV result.csv path (columns: label, prob_pos)")
     p.add_argument("--out_dir", type=str, default="plots_ts",
                    help="output directory")
+    p.add_argument("--n_bins", type=int, default=10,
+                   help="number of bins for calibration plot (quantile strategy)")
     return p.parse_args()
 
 
@@ -317,9 +308,9 @@ def main():
         f.write(f"Brier after: {brier_after:.6f}\n")
     print(f"[INFO] Saved temperature info → {t_info_path}")
 
-    # 6) Calibration Plot (Before vs After)
-    calib_png = os.path.join(args.out_dir, "calibration_temperature_scaling.png")
-    plot_calibration_medical(y_true, p_raw, p_cal, calib_png)
+    # 6) Calibration Plot (Before vs After, sklearn.calibration_curve 사용)
+    calib_png = os.path.join(args.out_dir, "calibration_plot_before_after_ts.png")
+    plot_calibration_sklearn(y_true, p_raw, p_cal, calib_png, n_bins=args.n_bins)
 
     # 7) DCA (Calibrated probability 기반)
     dca_png = os.path.join(args.out_dir, "dca_curve_calibrated.png")
