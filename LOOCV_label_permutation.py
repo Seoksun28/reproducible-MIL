@@ -252,4 +252,258 @@ class TransMIL(nn.Module):
 # ===============================
 # Train
 # ===============================
-def train_one_epoch(model, loa
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+
+    for feats, labels, _ in loader:
+        feats = feats.to(device)   # [1, N, D]
+        labels = labels.to(device) # [1]
+
+        optimizer.zero_grad()
+        out = model(data=feats, return_features=False)
+        loss = criterion(out["logits"], labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / max(1, len(loader))
+
+
+# ===============================
+# LOOCV
+# ===============================
+def run_loocv(args):
+    # ===== device 선택 (GPU 인덱스 반영) =====
+    if args.device == "cuda":
+        if torch.cuda.is_available():
+            n_gpu = torch.cuda.device_count()
+            if args.gpu < 0 or args.gpu >= n_gpu:
+                print(f"[WARN] GPU index {args.gpu} is out of range (0~{n_gpu-1}). CPU로 fallback 합니다.")
+                device_str = "cpu"
+            else:
+                device_str = f"cuda:{args.gpu}"
+        else:
+            print("[WARN] CUDA not available. CPU로 fallback 합니다.")
+            device_str = "cpu"
+    else:
+        device_str = "cpu"
+
+    device = torch.device(device_str)
+    print(f"[INFO] Using device: {device}")
+    set_seed(args.seed)
+
+    # 데이터 로드 (case, control 디렉토리)
+    items = load_items_from_dirs(args.case_dir, args.control_dir)
+    print(f"#slides total = {len(items)}")
+
+    # 환자 grouping
+    pid_to_indices = defaultdict(list)
+    for idx, (path, label) in enumerate(items):
+        fname = os.path.basename(path)
+        pid = extract_pid(fname)
+        pid_to_indices[pid].append(idx)
+
+    patients = sorted(pid_to_indices.keys())
+    print(f"#patients = {len(patients)}")
+
+    # ===============================
+    # [LABEL PERMUTATION] 환자 단위 라벨 섞기
+    # ===============================
+    if args.label_permutation:
+        print("[INFO] Running with LABEL PERMUTATION (patient-level)")
+        # 각 환자의 원래 라벨 (첫 슬라이드 기준)
+        pid_labels = []
+        for pid in patients:
+            first_idx = pid_to_indices[pid][0]
+            _, lab = items[first_idx]
+            pid_labels.append(lab)
+
+        pid_labels = np.array(pid_labels)
+        # 현재 set_seed로 global seed 고정되어 있어서, 여기서 shuffle도 재현성 유지
+        np.random.shuffle(pid_labels)
+
+        # 섞인 라벨을 환자별로 다시 부여
+        for pid, new_lab in zip(patients, pid_labels):
+            for idx in pid_to_indices[pid]:
+                path, _ = items[idx]
+                items[idx] = (path, int(new_lab))
+
+    # result 폴더 구조
+    os.makedirs(args.result_dir, exist_ok=True)
+    attn_dir = os.path.join(args.result_dir, "attention")
+    vec_dir = os.path.join(args.result_dir, "vector")
+    os.makedirs(attn_dir, exist_ok=True)
+    os.makedirs(vec_dir, exist_ok=True)
+
+    # result.csv
+    import csv
+    csv_path = os.path.join(args.result_dir, "result.csv")
+    with open(csv_path, "w", newline="") as csv_f:
+        writer = csv.writer(csv_f)
+        writer.writerow(["slide", "label", "pred", "prob_pos"])
+
+        all_labels = []
+        all_probs = []
+        all_preds = []
+
+        # ================== patient-wise LOOCV ==================
+        for fold_idx, test_pid in enumerate(patients):
+            print(f"\n========== Fold {fold_idx+1}/{len(patients)} | Test PID = {test_pid} ==========")
+
+            test_indices = pid_to_indices[test_pid]
+            train_indices = [
+                i for pid, idxs in pid_to_indices.items() if pid != test_pid for i in idxs
+            ]
+
+            train_items = [items[i] for i in train_indices]
+            test_items = [items[i] for i in test_indices]
+
+            print(f"Train slides: {len(train_items)}, Test slides: {len(test_items)}")
+
+            train_loader = DataLoader(
+                NPZSlideDataset(train_items, feature_key=args.feature_key),
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
+                collate_fn=mil_collate,
+                pin_memory=True,
+            )
+
+            test_loader = DataLoader(
+                NPZSlideDataset(test_items, feature_key=args.feature_key),
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=mil_collate,
+                pin_memory=True,
+            )
+
+            # ----- 모델 생성 -----
+            model = TransMIL(
+                n_classes=args.n_classes,
+                input_dim=args.input_dim,
+                embed_dim=args.embed_dim,
+                heads=args.heads,
+                num_landmarks=args.num_landmarks,
+                attn_dropout=args.attn_dropout,
+                pinv_iterations=args.pinv_iterations,
+            ).to(device)
+
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+            )
+
+            # ----- 고정 epoch 학습 -----
+            for epoch in range(1, args.epochs + 1):
+                loss = train_one_epoch(model, train_loader, optimizer, device)
+                print(f"[Fold {fold_idx+1}] Epoch {epoch}/{args.epochs} | Loss: {loss:.4f}")
+
+            # ----- Test + 결과 저장 -----
+            model.eval()
+            with torch.no_grad():
+                for feats, labels, paths in test_loader:
+                    feats = feats.to(device)
+                    labels = labels.to(device)
+
+                    out = model(data=feats, return_features=True)
+                    probs = out["Y_prob"][:, 1]   # positive class prob
+                    preds = out["Y_hat"]
+                    attn = out["attn"]            # [1, N]
+                    feat_vec = out["feat"]        # [1, embed_dim]
+
+                    slide_path = paths[0]
+                    slide_name = os.path.splitext(os.path.basename(slide_path))[0]
+
+                    label_int = int(labels.item())
+                    pred_int = int(preds.item())
+                    prob_pos = float(probs.item())
+
+                    # result.csv 기록
+                    writer.writerow([slide_name, label_int, pred_int, prob_pos])
+
+                    # global metric 용
+                    all_labels.append(label_int)
+                    all_probs.append(prob_pos)
+                    all_preds.append(pred_int)
+
+                    # attention 저장 (patch별 score)
+                    attn_np = attn.squeeze(0).cpu().numpy()    # [N]
+                    np.save(os.path.join(attn_dir, f"{slide_name}.npy"), attn_np)
+
+                    # pred 직전 layer feature 저장 (cls token)
+                    feat_np = feat_vec.squeeze(0).cpu().numpy()  # [embed_dim]
+                    np.save(os.path.join(vec_dir, f"{slide_name}.npy"), feat_np)
+
+    # ================== 전체 LOOCV 성능 ==================
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+    all_preds = np.array(all_preds)
+
+    overall_acc = accuracy_score(all_labels, all_preds)
+    try:
+        overall_auroc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        overall_auroc = float("nan")
+
+    txt_path = os.path.join(args.result_dir, "result.txt")
+    with open(txt_path, "w") as f:
+        f.write(f"Overall ACC: {overall_acc:.4f}\n")
+        f.write(f"Overall AUROC: {overall_auroc:.4f}\n")
+
+    print("\n===== LOOCV DONE =====")
+    print(f"Overall ACC: {overall_acc:.4f}, AUROC: {overall_auroc:.4f}")
+    print(f"Saved result.csv, result.txt under {args.result_dir}")
+
+
+# ===============================
+# Main
+# ===============================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Patient-wise LOOCV with TransMIL")
+
+    # data
+    parser.add_argument("--case_dir", type=str, required=True,
+                        help="case npz 폴더 (label=1)")
+    parser.add_argument("--control_dir", type=str, required=True,
+                        help="control npz 폴더 (label=0)")
+    parser.add_argument("--feature_key", type=str, default="features")
+    parser.add_argument("--result_dir", type=str, default="result_transmil_loocv")
+
+    # model
+    parser.add_argument("--n_classes", type=int, default=2)
+    parser.add_argument("--input_dim", type=int, default=1536)
+    parser.add_argument("--embed_dim", type=int, default=512)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--num_landmarks", type=int, default=None)
+    parser.add_argument("--attn_dropout", type=float, default=0.25)
+    parser.add_argument("--pinv_iterations", type=int, default=6)
+
+    # train
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=1)  # MIL 특성상 1 유지 추천
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+
+    # etc
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--gpu", type=int, default=0, help="GPU index (cuda일 때만 사용)")
+
+    # ===== label permutation 옵션 =====
+    parser.add_argument(
+        "--label_permutation",
+        action="store_true",
+        help="환자 단위로 라벨을 무작위로 섞어서 permutation test 수행"
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_loocv(args)
